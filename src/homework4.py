@@ -2,7 +2,7 @@ import torch
 import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
-
+import mujoco_viewer
 import environment
 
 
@@ -192,11 +192,76 @@ def bezier(p, steps=100):
     return curve
 
 
+
+def train_cnp(
+    model,
+    dataset,
+    epochs=50,
+    lr=1e-3,
+    n_context_min=5,
+    n_context_max=50,
+    n_target_min=10,
+    n_target_max=100,
+    device="cpu"
+):
+    model = model.to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    model.train()
+
+    for epoch in range(epochs):
+        total_loss = 0.0
+
+        for traj, h in dataset:
+            traj = np.asarray(traj)
+            T = traj.shape[0]
+
+            n_context = np.random.randint(n_context_min, min(n_context_max, T) + 1)
+            n_target = np.random.randint(n_target_min, min(n_target_max, T) + 1)
+
+            idx = np.random.permutation(T)
+            ctx_idx = idx[:n_context]
+            tgt_idx = idx[:n_target]
+
+            ctx = traj[ctx_idx]
+            tgt = traj[tgt_idx]
+
+            t_ctx = torch.tensor(ctx[:, 0:1], dtype=torch.float32)
+            y_ctx = torch.tensor(ctx[:, 1:5], dtype=torch.float32)
+            h_ctx = torch.full((n_context, 1), h, dtype=torch.float32)
+
+            obs = torch.cat([t_ctx, h_ctx, y_ctx], dim=-1).unsqueeze(0)
+
+            t_tgt = torch.tensor(tgt[:, 0:1], dtype=torch.float32)
+            h_tgt = torch.full((n_target, 1), h, dtype=torch.float32)
+
+            target = torch.cat([t_tgt, h_tgt], dim=-1).unsqueeze(0)
+
+            target_truth = torch.tensor(tgt[:, 1:5], dtype=torch.float32).unsqueeze(0)
+
+            loss = model.nll_loss(
+                obs.to(device),
+                target.to(device),
+                target_truth.to(device)
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        print(f"Epoch {epoch+1}/{epochs} | Loss: {total_loss/len(dataset):.6f}")
+
+    return model
+
+
 if __name__ == "__main__":
-    env = Hw5Env(render_mode="gui")
+    env = Hw5Env(render_mode="offscreen") # I don't wanna visualise it for 100 times.
     states_arr = []
     for i in range(100):
         env.reset()
+        h = env.obj_height   # the height of the object, which is random and provided by the environment
         p_1 = np.array([0.5, 0.3, 1.04])
         p_2 = np.array([0.5, 0.15, np.random.uniform(1.04, 1.4)])
         p_3 = np.array([0.5, -0.15, np.random.uniform(1.04, 1.4)])
@@ -210,15 +275,89 @@ if __name__ == "__main__":
             env._set_ee_pose(p, rotation=[-90, 0, 180], max_iters=10)
             states.append(env.high_level_state())
         states = np.stack(states)
-        states_arr.append(states)
+        states_arr.append((states, h))
         print(f"Collected {i+1} trajectories.", end="\r")
+        
+    model = CNP(in_shape=(2, 4), hidden_size=128, num_hidden_layers=3)  
+    train_cnp(model, states_arr)    
+    model.eval()
 
-    fig, ax = plt.subplots(1, 2)
-    for states in states_arr:
-        ax[0].plot(states[:, 0], states[:, 1], alpha=0.2, color="b")
-        ax[0].set_xlabel("e_y")
-        ax[0].set_ylabel("e_z")
-        ax[1].plot(states[:, 2], states[:, 3], alpha=0.2, color="r")
-        ax[1].set_xlabel("o_y")
-        ax[1].set_ylabel("o_z")
+    n_tests = 100
+    ee_mse_list = []
+    obj_mse_list = []
+    
+    for _ in range(n_tests):
+        # sample a random trajectory from dataset
+        traj, h = states_arr[np.random.randint(len(states_arr))]
+        traj = np.asarray(traj)
+        T = traj.shape[0]
+
+        # random context / target split
+        n_context = np.random.randint(1, T)
+        n_target = np.random.randint(1, T)
+
+        idx = np.random.permutation(T)
+        ctx_idx = idx[:n_context]
+        tgt_idx = idx[:n_target]
+
+        ctx = traj[ctx_idx]
+        tgt = traj[tgt_idx]
+
+        # build context
+        t_ctx = torch.tensor(ctx[:, 0:1], dtype=torch.float32)
+        y_ctx = torch.tensor(ctx[:, 1:5], dtype=torch.float32)
+        h_ctx = torch.full((n_context, 1), h, dtype=torch.float32)
+        obs = torch.cat([t_ctx, h_ctx,y_ctx], dim=-1).unsqueeze(0)
+
+        # build query
+        t_tgt = torch.tensor(tgt[:, 0:1], dtype=torch.float32)
+        h_tgt = torch.full((n_target, 1), h, dtype=torch.float32)
+        target = torch.cat([t_tgt, h_tgt], dim=-1).unsqueeze(0)
+
+        target_truth = torch.tensor(tgt[:, 1:5], dtype=torch.float32).unsqueeze(0)
+
+        with torch.no_grad():
+            pred_mean, _ = model(obs, target)
+
+        pred = pred_mean.squeeze(0).numpy()
+        gt = target_truth.squeeze(0).numpy()
+
+        # split errors
+        ee_mse = np.mean((pred[:, 0:2] - gt[:, 0:2])**2)  # (ey, ez)
+        obj_mse = np.mean((pred[:, 2:4] - gt[:, 2:4])**2)  # (oy, oz)
+
+        ee_mse_list.append(ee_mse)
+        obj_mse_list.append(obj_mse)
+
+    # stats
+    ee_mean, ee_std = np.mean(ee_mse_list), np.std(ee_mse_list)
+    obj_mean, obj_std = np.mean(obj_mse_list), np.std(obj_mse_list)
+
+    # bar plot
+    plt.figure()
+    plt.bar([0, 1], [ee_mean, obj_mean], yerr=[ee_std, obj_std])
+    plt.xticks([0, 1], ["End-Effector", "Object"])
+    plt.ylabel("MSE")
+    plt.title("Prediction Error (mean ± std)")
     plt.show()
+
+
+
+
+fig, ax = plt.subplots(1, 2)
+
+for states, _ in states_arr:
+    ax[0].plot(states[:, 0], states[:, 1], alpha=0.2, color="b")
+    ax[1].plot(states[:, 2], states[:, 3], alpha=0.2, color="r")
+
+ax[0].set(xlabel="e_y", ylabel="e_z")
+ax[1].set(xlabel="o_y", ylabel="o_z")
+
+# force same scale
+ax[0].set_xlim(-0.5, 0.5)
+ax[1].set_xlim(-0.5, 0.5)
+
+ax[0].set_ylim(-0.5, 0.5)
+ax[1].set_ylim(-0.5, 0.5)
+
+plt.show()
