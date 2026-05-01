@@ -354,10 +354,11 @@ ax[0].set(xlabel="e_y", ylabel="e_z")
 ax[1].set(xlabel="o_y", ylabel="o_z")
 
 # force same scale
-ax[0].set_xlim(-0.5, 0.5)
-ax[1].set_xlim(-0.5, 0.5)
+#ax[0].set_xlim(-0.5, 0.5)
+#ax[1].set_xlim(-0.5, 0.5)
 
-ax[0].set_ylim(-0.5, 0.5)
-ax[1].set_ylim(-0.5, 0.5)
+#ax[0].set_ylim(-0.5, 0.5)
+#ax[1].set_ylim(-0.5, 0.5)
+#forcing limits gave me an empty plot, so I commented it out.
 
 plt.show()
